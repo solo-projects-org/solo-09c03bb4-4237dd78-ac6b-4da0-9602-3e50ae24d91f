@@ -32,8 +32,7 @@
       <td class="muted">
         {% for a in it.alternatives %}{{ a.license_no }}（{{ a.attribution }}）{% if not loop.last %}；{% endif %}
         {% else %}无{% endfor %}
-      </td>
-    </tr>
+      </td>    </tr>
     {% endfor %}
   </table>
 </section>
@@ -44,7 +43,8 @@
     <p class="muted">清单已确认，无需操作。若授权发生变化，系统会要求重新确认。</p>
   {% else %}
     <p class="muted">请核对上表中的授权号与署名。确认时系统会重新校验授权是否仍然有效；
-      若清单中的授权已被撤回，将维持停供并提示重新核对。</p>
+      若清单中的授权已被撤回，将维持停供并提示重新核对。
+      同署名换证由系统自动完成，无需再次确认。</p>
     <form method="post" action="/exhibitions/{{ ex.id }}/confirm">
       {% for it in st['items'] %}
         {% if it.license_valid %}

@@ -1,9 +1,13 @@
-"""核心业务逻辑：CSV 导入、清单同步（自动换用/停供）、编辑确认、授权撤回。
+"""核心业务逻辑：CSV 导入、授权选用/换证、编辑确认、授权撤回。
 
 设计要点：
-- manifest_items 记录每张（展图 × 原图）当前选用的授权与署名确认状态。
-- sync_exhibition 是幂等的：任何读写路径都会先同步，保证下载/页面/接口
-  看到的始终是“当前有效且已确认署名”的清单，服务重启后状态由 SQLite 恢复。
+- manifest_items 记录每张（展图 × 原图）**已确认的署名**，而不是写死某个授权号。
+  读取时由 EFFECTIVE_ITEMS_SQL 实时解析“当前应选用的授权”：
+  同署名的有效商用授权优先（沿用原有选证顺序，即授权 id 最小者），
+  没有同署名授权时才退到任一有效商用授权并视为“待确认新署名”。
+- 因此撤回一张被上千张展图选用的授权，只需要改 licenses 表的一行；
+  manifest_items 不再随展图数量被批量改写。换证后页面、API、确认与下载
+  都读取同一个解析结果，同署名的既有确认继续有效。
 - 授权一旦撤回即为终态；导入时授权号已存在则整行跳过，重传不能恢复。
 """
 import csv
@@ -148,104 +152,95 @@ def import_licenses(conn, content: bytes, batch_label: str = "") -> dict:
     return stats
 
 
-# ---------------------------------------------------------------- 清单同步
+# ---------------------------------------------------------------- 授权选用
 
-def _pick_license(conn, original_id: int, preferred_attribution):
-    """为原图挑选有效商用授权：优先与在用署名一致的（用于自动换用）。"""
-    if preferred_attribution:
-        row = conn.execute(
-            "SELECT * FROM licenses WHERE original_id=? AND commercial=1 AND revoked=0"
-            " AND attribution=? ORDER BY id LIMIT 1",
-            (original_id, preferred_attribution),
-        ).fetchone()
-        if row:
-            return row
-    return conn.execute(
-        "SELECT * FROM licenses WHERE original_id=? AND commercial=1 AND revoked=0"
-        " ORDER BY id LIMIT 1",
-        (original_id,),
-    ).fetchone()
-
-
-def sync_exhibition(conn, exhibition_id: int) -> None:
-    """同步一个展图的清单项（幂等）。
-
-    - 在用授权仍有效（未撤回且允许商用）：保持不变；
-    - 在用授权失效：存在同署名的有效商用授权 → 自动换用，保留署名确认；
-      只有不同署名的 → 换用并置为“待确认署名”；
-      完全没有 → 标记缺授权、待确认。
-    """
-    origs = conn.execute(
-        "SELECT o.id AS original_id FROM exhibition_originals eo"
-        " JOIN originals o ON o.id = eo.original_id WHERE eo.exhibition_id=?",
-        (exhibition_id,),
-    ).fetchall()
-    for o in origs:
-        oid = o["original_id"]
-        item = conn.execute(
-            "SELECT * FROM manifest_items WHERE exhibition_id=? AND original_id=?",
-            (exhibition_id, oid),
-        ).fetchone()
-        if item is None:
-            lic = _pick_license(conn, oid, None)
-            conn.execute(
-                "INSERT INTO manifest_items (exhibition_id, original_id, license_id, attribution,"
-                " confirmed, updated_at) VALUES (?,?,?,?,0,?)",
-                (exhibition_id, oid, lic["id"] if lic else None,
-                 lic["attribution"] if lic else "", now()),
-            )
-            continue
-        cur = None
-        if item["license_id"]:
-            cur = conn.execute("SELECT * FROM licenses WHERE id=?", (item["license_id"],)).fetchone()
-        if cur and cur["commercial"] == 1 and cur["revoked"] == 0:
-            continue  # 在用授权有效
-        lic = _pick_license(conn, oid, item["attribution"] or None)
-        if lic is None:
-            conn.execute(
-                "UPDATE manifest_items SET license_id=NULL, confirmed=0, updated_at=? WHERE id=?",
-                (now(), item["id"]),
-            )
-        else:
-            # 同署名换用保留确认状态；署名变化则必须重新确认
-            confirmed = item["confirmed"] if lic["attribution"] == item["attribution"] else 0
-            conn.execute(
-                "UPDATE manifest_items SET license_id=?, attribution=?, confirmed=?, updated_at=?"
-                " WHERE id=?",
-                (lic["id"], lic["attribution"], confirmed, now(), item["id"]),
-            )
+# 每张（展图 × 原图）当前应选用的授权，由数据库实时解析，不落库：
+#   1. 优先选同一原图下**同署名**的有效商用授权（沿用原有选证顺序：授权 id 最小者）；
+#      授权号为追加分配、不会出现更小的新 id，因此同署名换证结果稳定；
+#   2. 没有同署名备选时，退到任一有效商用授权（id 最小），并视为“待确认新署名”；
+#   3. 完全没有有效商用授权 → license_id 为 NULL，即“缺授权”。
+# confirmed 当且仅当已确认的署名正是当前选用授权的署名；同署名换证时确认保持，
+# 因此“已有署名确认继续有效”。撤回只需把 licenses 表的一行置为 revoked，
+# 无需按展图数量批量改写清单，页面、API、确认与下载在读取时得到同一个授权号。
+EFFECTIVE_ITEMS_SQL = """
+SELECT eo.exhibition_id,
+       e.exhibition_no,
+       eo.original_id,
+       o.original_no,
+       mi.attribution AS confirmed_attribution,
+       CASE WHEN mi.confirmed = 1 AND lic.attribution = mi.attribution
+            THEN 1 ELSE 0 END AS confirmed,
+       lic.id AS license_id,
+       lic.license_no,
+       lic.commercial,
+       lic.revoked,
+       lic.attribution AS license_attribution
+FROM exhibition_originals eo
+JOIN exhibitions e ON e.id = eo.exhibition_id
+JOIN originals o ON o.id = eo.original_id
+LEFT JOIN manifest_items mi
+       ON mi.exhibition_id = eo.exhibition_id AND mi.original_id = eo.original_id
+LEFT JOIN licenses same ON same.id = (
+    SELECT l.id FROM licenses l
+     WHERE l.original_id = eo.original_id AND l.commercial = 1 AND l.revoked = 0
+       AND mi.attribution <> '' AND l.attribution = mi.attribution
+     ORDER BY l.id LIMIT 1)
+LEFT JOIN licenses lic ON lic.id = COALESCE(same.id, (
+    SELECT l.id FROM licenses l
+     WHERE l.original_id = eo.original_id AND l.commercial = 1 AND l.revoked = 0
+     ORDER BY l.id LIMIT 1))
+"""
 
 
-def sync_all(conn) -> None:
-    for r in conn.execute("SELECT id FROM exhibitions").fetchall():
-        sync_exhibition(conn, r["id"])
+def _effective_rows(conn, where: str = "", params=()) -> list:
+    sql = EFFECTIVE_ITEMS_SQL
+    if where:
+        sql += " WHERE " + where
+    sql += " ORDER BY e.exhibition_no, o.original_no"
+    return conn.execute(sql, params).fetchall()
+
+
+def _item_dict(row) -> dict:
+    d = dict(row)
+    d["confirmed"] = bool(d["confirmed"])
+    d["license_valid"] = d["license_id"] is not None
+    # 缺授权时仍显示最后一次确认过的署名，便于编辑判断；授权号为空。
+    d["attribution"] = d["license_attribution"] if d["license_valid"] else (
+        d["confirmed_attribution"] or "")
+    d["commercial"] = d["commercial"] if d["license_valid"] else None
+    d["revoked"] = d["revoked"] if d["license_valid"] else None
+    return d
 
 
 def get_items(conn, exhibition_id: int) -> list:
-    rows = conn.execute(
-        "SELECT mi.id, mi.exhibition_id, mi.original_id, mi.license_id, mi.attribution,"
-        " mi.confirmed, o.original_no,"
-        " l.license_no, l.commercial, l.revoked"
-        " FROM manifest_items mi"
-        " JOIN originals o ON o.id = mi.original_id"
-        " LEFT JOIN licenses l ON l.id = mi.license_id"
-        " WHERE mi.exhibition_id=? ORDER BY o.original_no",
-        (exhibition_id,),
-    ).fetchall()
-    items = []
-    for r in rows:
-        d = dict(r)
-        d["license_valid"] = bool(d["license_id"]) and d["commercial"] == 1 and d["revoked"] == 0
-        items.append(d)
-    return items
+    return [_item_dict(r) for r in _effective_rows(
+        conn, "eo.exhibition_id=?", (exhibition_id,))]
 
 
 def exhibition_status(conn, exhibition_id: int) -> dict:
-    """先同步再汇总：downloadable 当且仅当每张原图都有有效商用授权且署名已确认。"""
-    sync_exhibition(conn, exhibition_id)
-    items = get_items(conn, exhibition_id)
+    """汇总：downloadable 当且仅当每张原图都有有效商用授权且署名已确认。
+
+    只读，不写数据库；状态完全由当前授权表与已确认署名解析而来。
+    """
+    return _status_of(get_items(conn, exhibition_id))
+
+
+def exhibition_statuses(conn) -> dict:
+    """一次查询得到所有展图状态：{exhibition_id: status}，供列表页/列表 API 使用。"""
+    grouped = {}
+    for r in _effective_rows(conn):
+        grouped.setdefault(r["exhibition_id"], []).append(_item_dict(r))
+    return {ex_id: _status_of(items) for ex_id, items in grouped.items()}
+
+
+def empty_status() -> dict:
+    return _status_of([])
+
+
+def _status_of(items: list) -> dict:
     missing = [it["original_no"] for it in items if not it["license_valid"]]
-    unconfirmed = [it["original_no"] for it in items if it["license_valid"] and not it["confirmed"]]
+    unconfirmed = [it["original_no"] for it in items
+                   if it["license_valid"] and not it["confirmed"]]
     return {
         "items": items,
         "missing": missing,
@@ -254,36 +249,144 @@ def exhibition_status(conn, exhibition_id: int) -> dict:
     }
 
 
+def license_usage(conn) -> dict:
+    """当前授权使用情况：{license_id: [展图号, ...]}，按实时选用结果统计。"""
+    usage = {}
+    for r in _effective_rows(conn):
+        if r["license_id"] is not None:
+            usage.setdefault(r["license_id"], []).append(r["exhibition_no"])
+    return usage
+
+
+def revoke_previews(conn) -> dict:
+    """一次查询预演所有在用授权撤回后的结果，{license_id: [预览...]}。
+
+    铺开规则与 revoke_license 完全一致：同署名有效商用授权优先（id 最小），
+    否则退到任一有效商用授权（待确认），都没有则缺授权。
+    每条预览：{exhibition_no, next_license_no, next_attribution, same_attribution}。
+    """
+    rows = conn.execute(
+        "WITH eff AS (" + EFFECTIVE_ITEMS_SQL + ")"
+        " SELECT eff.license_id, eff.exhibition_no, eff.confirmed_attribution,"
+        "        COALESCE("
+        "          (SELECT l.license_no FROM licenses l"
+        "            WHERE l.original_id = eff.original_id AND l.commercial = 1"
+        "              AND l.revoked = 0 AND l.id <> eff.license_id"
+        "              AND eff.confirmed_attribution <> ''"
+        "              AND l.attribution = eff.confirmed_attribution"
+        "            ORDER BY l.id LIMIT 1),"
+        "          (SELECT l.license_no FROM licenses l"
+        "            WHERE l.original_id = eff.original_id AND l.commercial = 1"
+        "              AND l.revoked = 0 AND l.id <> eff.license_id"
+        "            ORDER BY l.id LIMIT 1)) AS next_license_no,"
+        "        COALESCE("
+        "          (SELECT l.attribution FROM licenses l"
+        "            WHERE l.original_id = eff.original_id AND l.commercial = 1"
+        "              AND l.revoked = 0 AND l.id <> eff.license_id"
+        "              AND eff.confirmed_attribution <> ''"
+        "              AND l.attribution = eff.confirmed_attribution"
+        "            ORDER BY l.id LIMIT 1),"
+        "          (SELECT l.attribution FROM licenses l"
+        "            WHERE l.original_id = eff.original_id AND l.commercial = 1"
+        "              AND l.revoked = 0 AND l.id <> eff.license_id"
+        "            ORDER BY l.id LIMIT 1)) AS next_attribution"
+        " FROM eff WHERE eff.license_id IS NOT NULL"
+        " ORDER BY eff.exhibition_no"
+    ).fetchall()
+    previews = {}
+    for r in rows:
+        previews.setdefault(r["license_id"], []).append({
+            "exhibition_no": r["exhibition_no"],
+            "next_license_no": r["next_license_no"],
+            "next_attribution": r["next_attribution"],
+            "same_attribution": (r["next_license_no"] is not None
+                                 and r["next_attribution"] == (r["confirmed_attribution"] or "")),
+        })
+    return previews
+
+
+def revoke_preview(conn, license_id: int) -> list:
+    """单个授权的撤回预演（只读），规则同 revoke_previews。"""
+    return revoke_previews(conn).get(license_id, [])
+
+
 # ---------------------------------------------------------------- 撤回与确认
 
+def _classify_after_revoke(conn, original_id: int, exhibition_ids) -> dict:
+    """撤回后按实时解析结果归类受影响的展图：自动换用 / 待确认新署名 / 缺授权。"""
+    result = {"switched": [], "need_confirm": [], "missing": [], "new_licenses": set()}
+    wanted = set(exhibition_ids)
+    if not wanted:
+        return result
+    # 该原图的展图通常不多；这里只读，且不拼 IN 列表，避免超长 SQL。
+    for r in _effective_rows(conn, "eo.original_id=?", (original_id,)):
+        if r["exhibition_id"] not in wanted:
+            continue
+        if r["license_id"] is None:
+            result["missing"].append(r["exhibition_no"])
+        elif r["confirmed"]:
+            result["switched"].append(r["exhibition_no"])
+            result["new_licenses"].add(r["license_no"])
+        else:
+            result["need_confirm"].append(r["exhibition_no"])
+            result["new_licenses"].add(r["license_no"])
+    return result
+
+
+def _names(names, limit: int = 5) -> str:
+    names = sorted(names)
+    head = "、".join(names[:limit])
+    if len(names) > limit:
+        return f"{head} 等 {len(names)} 个展图"
+    return head
+
+
 def revoke_license(conn, license_id: int):
-    """撤回授权（终态）。返回 (license_row, message)；授权不存在时 row 为 None。"""
+    """撤回授权（终态）并让递补立即生效。返回 (license_row, message)。
+
+    撤回与同署名递补在调用方的同一事务内完成：只改 licenses 表的一行，
+    实际改动的行数与原图被多少张展图选用无关。若事务失败，调用方回滚，
+    原授权继续有效（不会出现“撤回了但没有递补”的中间状态）。
+    """
     lic = conn.execute("SELECT * FROM licenses WHERE id=?", (license_id,)).fetchone()
     if lic is None:
         return None, "授权不存在"
     if lic["revoked"]:
         return lic, f"授权 {lic['license_no']} 此前已撤回，重复撤回或重传 CSV 都不会恢复"
-    conn.execute("UPDATE licenses SET revoked=1, revoked_at=? WHERE id=?", (now(), license_id))
-    ex_ids = [
-        r["exhibition_id"]
-        for r in conn.execute(
-            "SELECT exhibition_id FROM exhibition_originals WHERE original_id=?",
-            (lic["original_id"],),
-        ).fetchall()
+
+    # 撤回前记录真正在用这张授权的展图，仅用于生成结果提示（只读）。
+    in_use = [
+        r["exhibition_id"] for r in _effective_rows(
+            conn, "eo.original_id=? AND lic.id=?", (lic["original_id"], license_id))
     ]
-    for ex_id in ex_ids:
-        sync_exhibition(conn, ex_id)  # 有同署名有效授权则自动换用，否则停供
-    return lic, f"授权 {lic['license_no']} 已撤回"
+
+    conn.execute("UPDATE licenses SET revoked=1, revoked_at=? WHERE id=?", (now(), license_id))
+
+    effect = _classify_after_revoke(conn, lic["original_id"], in_use)
+    parts = [f"授权 {lic['license_no']} 已撤回"]
+    if not in_use:
+        parts.append("当前没有展图选用该授权")
+    if effect["switched"]:
+        parts.append(
+            f"同署名递补为 {('、'.join(sorted(effect['new_licenses'])))}："
+            f"{_names(effect['switched'])}，原署名确认继续有效")
+    if effect["need_confirm"]:
+        parts.append(
+            f"停供待确认新署名（{('、'.join(sorted(effect['new_licenses'])))}）："
+            f"{_names(effect['need_confirm'])}")
+    if effect["missing"]:
+        parts.append(f"停供缺有效商用授权：{_names(effect['missing'])}")
+    return lic, "；".join(parts)
 
 
 def confirm_manifest(conn, exhibition_id: int, editor: str, submitted: dict) -> list:
     """编辑确认当前清单。submitted: {original_id: (license_no, attribution)}。
 
     在调用方的事务内执行；返回问题列表，非空表示维持停供（调用方应回滚）。
-    交错场景：确认时重新核对授权有效性，若清单中的授权刚被撤回或清单已变更，
-    则拒绝确认并提示重新核对。
+    确认对象与下载使用同一个实时解析出的授权号；交错场景下若清单中的授权
+    刚被撤回或清单已变更，则拒绝确认并提示重新核对。
+    同署名递补已由系统自动完成，无需编辑再次确认。
     """
-    sync_exhibition(conn, exhibition_id)
     items = get_items(conn, exhibition_id)
     if not items:
         return ["该展图没有关联原图，无法确认"]
@@ -301,10 +404,17 @@ def confirm_manifest(conn, exhibition_id: int, editor: str, submitted: dict) -> 
             problems.append(f"原图 {it['original_no']}：清单已变更，请重新核对后再确认")
     if problems:
         return problems
-    conn.execute(
-        "UPDATE manifest_items SET confirmed=1, updated_at=? WHERE exhibition_id=?",
-        (now(), exhibition_id),
-    )
+    # 只写需要变更的行：已确认且署名未变的清单项不必重写。
+    for it in items:
+        if it["confirmed"]:
+            continue
+        conn.execute(
+            "INSERT INTO manifest_items (exhibition_id, original_id, attribution, confirmed,"
+            " updated_at) VALUES (?,?,?,1,?)"
+            " ON CONFLICT(exhibition_id, original_id) DO UPDATE SET"
+            " attribution=excluded.attribution, confirmed=1, updated_at=excluded.updated_at",
+            (exhibition_id, it["original_id"], it["attribution"], now()),
+        )
     detail = "; ".join(f"{it['original_no']}={it['license_no']}" for it in items)
     conn.execute(
         "INSERT INTO confirmations (exhibition_id, editor, detail) VALUES (?,?,?)",

@@ -53,16 +53,16 @@ def get_exhibition_or_404(conn, ex_id: int):
 def index(request: Request):
     conn = db.connect()
     try:
-        conn.execute("BEGIN IMMEDIATE")
-        logic.sync_all(conn)
+        conn.execute("BEGIN")
         rows = conn.execute(
             "SELECT e.*, (SELECT COUNT(*) FROM exhibition_originals eo"
             " WHERE eo.exhibition_id=e.id) AS total"
             " FROM exhibitions e ORDER BY e.exhibition_no"
         ).fetchall()
+        statuses = logic.exhibition_statuses(conn)  # 一次查询，避免每个展图各查一遍
         exhibitions = []
         for ex in rows:
-            st = logic.exhibition_status(conn, ex["id"])
+            st = statuses.get(ex["id"]) or logic.empty_status()
             exhibitions.append({
                 "id": ex["id"], "exhibition_no": ex["exhibition_no"], "title": ex["title"],
                 "total": ex["total"], "downloadable": st["downloadable"],
@@ -80,7 +80,7 @@ def index(request: Request):
 def exhibition_detail(request: Request, ex_id: int):
     conn = db.connect()
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("BEGIN")
         ex = get_exhibition_or_404(conn, ex_id)
         st = logic.exhibition_status(conn, ex_id)
         for it in st["items"]:
@@ -107,23 +107,23 @@ def exhibition_detail(request: Request, ex_id: int):
 def licenses_page(request: Request):
     conn = db.connect()
     try:
-        conn.execute("BEGIN IMMEDIATE")
-        logic.sync_all(conn)
-        rows = conn.execute(
-            "SELECT l.*, o.original_no,"
-            " GROUP_CONCAT(DISTINCT e.exhibition_no) AS used_by"
-            " FROM licenses l"
-            " JOIN originals o ON o.id = l.original_id"
-            " LEFT JOIN manifest_items mi ON mi.license_id = l.id"
-            " LEFT JOIN exhibitions e ON e.id = mi.exhibition_id"
-            " GROUP BY l.id ORDER BY l.id"
-        ).fetchall()
+        conn.execute("BEGIN")
+        rows = [dict(r) for r in conn.execute(
+            "SELECT l.*, o.original_no FROM licenses l"
+            " JOIN originals o ON o.id = l.original_id ORDER BY l.id"
+        ).fetchall()]
+        usage = logic.license_usage(conn)  # 与展图详情/API 相同的实时选用结果
+        previews = logic.revoke_previews(conn)  # 一次查询算出所有授权的撤回后果
+        for r in rows:
+            r["used_by"] = "、".join(usage.get(r["id"], []))
+            # 只对正在使用的授权预演：同署名递补 / 待确认新署名 / 缺授权
+            r["preview"] = [] if r["revoked"] else previews.get(r["id"], [])
         conn.commit()
     finally:
         conn.close()
     return templates.TemplateResponse(
         request=request, name="licenses.html",
-        context={"licenses": [dict(r) for r in rows], **flash_of(request)})
+        context={"licenses": rows, **flash_of(request)})
 
 
 # ---------------------------------------------------------------- 导入
@@ -139,7 +139,6 @@ async def upload_mapping(file: UploadFile):
         except ValueError as e:
             conn.rollback()
             return redirect("/", err=f"对照 CSV 导入失败：{e}")
-        logic.sync_all(conn)
         conn.commit()
     finally:
         conn.close()
@@ -162,7 +161,6 @@ async def upload_licenses(request: Request, file: UploadFile):
         except ValueError as e:
             conn.rollback()
             return redirect("/", err=f"授权 CSV 导入失败：{e}")
-        logic.sync_all(conn)
         conn.commit()
     finally:
         conn.close()
@@ -181,7 +179,12 @@ async def revoke(license_id: int):
     conn = db.connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        lic, message = logic.revoke_license(conn, license_id)
+        try:
+            lic, message = logic.revoke_license(conn, license_id)
+        except Exception:
+            # 撤回与递补是一个事务：任何失败整体回滚，原授权继续有效。
+            conn.rollback()
+            return redirect("/licenses", err="撤回失败，已回滚，原授权继续有效")
         if lic is None:
             conn.rollback()
             return redirect("/licenses", err=message)
@@ -226,7 +229,7 @@ async def confirm(ex_id: int, request: Request):
 def download_manifest(ex_id: int):
     conn = db.connect()
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("BEGIN")  # 只读快照：与撤回并发时也拿到一致清单
         get_exhibition_or_404(conn, ex_id)
         st = logic.exhibition_status(conn, ex_id)
         if not st["downloadable"]:
@@ -248,7 +251,11 @@ def download_manifest(ex_id: int):
     content = "﻿" + output.getvalue()  # BOM，便于 Excel 打开
     return Response(
         content, media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="manifest_{ex_id}.csv"'})
+        headers={
+            "Content-Disposition": f'attachment; filename="manifest_{ex_id}.csv"',
+            # 清单随授权状态实时变化，避免浏览器/代理缓存旧授权号
+            "Cache-Control": "no-store",
+        })
 
 
 # ---------------------------------------------------------------- JSON API
@@ -257,12 +264,12 @@ def download_manifest(ex_id: int):
 def api_exhibitions():
     conn = db.connect()
     try:
-        conn.execute("BEGIN IMMEDIATE")
-        logic.sync_all(conn)
+        conn.execute("BEGIN")
         rows = conn.execute("SELECT * FROM exhibitions ORDER BY exhibition_no").fetchall()
+        statuses = logic.exhibition_statuses(conn)
         result = []
         for ex in rows:
-            st = logic.exhibition_status(conn, ex["id"])
+            st = statuses.get(ex["id"]) or logic.empty_status()
             result.append({
                 "id": ex["id"], "exhibition_no": ex["exhibition_no"], "title": ex["title"],
                 "downloadable": st["downloadable"],
@@ -278,7 +285,7 @@ def api_exhibitions():
 def api_exhibition(ex_id: int):
     conn = db.connect()
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("BEGIN")
         ex = get_exhibition_or_404(conn, ex_id)
         st = logic.exhibition_status(conn, ex_id)
         conn.commit()
@@ -300,19 +307,16 @@ def api_exhibition(ex_id: int):
 def api_licenses():
     conn = db.connect()
     try:
-        conn.execute("BEGIN IMMEDIATE")
-        logic.sync_all(conn)
-        rows = conn.execute(
+        conn.execute("BEGIN")
+        rows = [dict(r) for r in conn.execute(
             "SELECT l.id, l.license_no, o.original_no, l.commercial, l.attribution,"
-            " l.revoked, l.revoked_at, l.batch_label,"
-            " GROUP_CONCAT(DISTINCT e.exhibition_no) AS used_by"
-            " FROM licenses l"
-            " JOIN originals o ON o.id = l.original_id"
-            " LEFT JOIN manifest_items mi ON mi.license_id = l.id"
-            " LEFT JOIN exhibitions e ON e.id = mi.exhibition_id"
-            " GROUP BY l.id ORDER BY l.id"
-        ).fetchall()
+            " l.revoked, l.revoked_at, l.batch_label"
+            " FROM licenses l JOIN originals o ON o.id = l.original_id ORDER BY l.id"
+        ).fetchall()]
+        usage = logic.license_usage(conn)
+        for r in rows:
+            r["used_by"] = usage.get(r["id"], [])
         conn.commit()
-        return [dict(r) for r in rows]
+        return rows
     finally:
         conn.close()

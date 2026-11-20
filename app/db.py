@@ -13,11 +13,12 @@ def db_path() -> str:
 def connect() -> sqlite3.Connection:
     path = db_path()
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    # isolation_level=None: 自动提交，由业务代码显式 BEGIN IMMEDIATE 控制写事务
+    # isolation_level=None: 自动提交，由业务代码显式 BEGIN / BEGIN IMMEDIATE 控制事务
     conn = sqlite3.connect(path, timeout=10, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")  # WAL 下安全，写延迟更低
     return conn
 
 
@@ -55,12 +56,18 @@ CREATE TABLE IF NOT EXISTS manifest_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     exhibition_id INTEGER NOT NULL REFERENCES exhibitions(id),
     original_id INTEGER NOT NULL REFERENCES originals(id),
-    license_id INTEGER REFERENCES licenses(id),   -- 当前选用的授权，NULL 表示缺授权
-    attribution TEXT NOT NULL DEFAULT '',          -- 选用授权对应的署名
-    confirmed INTEGER NOT NULL DEFAULT 0,          -- 编辑是否已确认该署名
+    license_id INTEGER REFERENCES licenses(id),   -- 旧版字段，保留兼容；当前选用改为读取时解析
+    attribution TEXT NOT NULL DEFAULT '',          -- 编辑已确认的署名
+    confirmed INTEGER NOT NULL DEFAULT 0,          -- 该署名是否已被编辑确认
     updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
     UNIQUE (exhibition_id, original_id)
 );
+CREATE INDEX IF NOT EXISTS idx_manifest_lookup
+    ON manifest_items (exhibition_id, original_id, confirmed);
+CREATE INDEX IF NOT EXISTS idx_licenses_pick
+    ON licenses (original_id, commercial, revoked, attribution, id);
+CREATE INDEX IF NOT EXISTS idx_links_original
+    ON exhibition_originals (original_id, exhibition_id);
 
 CREATE TABLE IF NOT EXISTS confirmations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

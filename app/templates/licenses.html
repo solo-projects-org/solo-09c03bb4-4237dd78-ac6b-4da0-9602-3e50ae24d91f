@@ -4,7 +4,9 @@
 <section>
   <h2>授权管理</h2>
   <p class="muted">撤回为终态操作：撤回后不可恢复，重传相同授权号的 CSV 也不会恢复。
-    撤回“使用中”的授权时，若存在同署名的有效商用授权，系统会自动换用；否则对应展图停供。</p>
+    撤回“使用中”的授权时，若存在同署名的有效商用授权，系统会在同一事务内自动递补
+    （已有署名确认继续有效）；否则对应展图停供。撤销的写入量只与授权本身有关，
+    与原图被多少张展图选用无关。</p>
   {% if licenses %}
   <table>
     <tr><th>授权号</th><th>原图号</th><th>允许商用</th><th>署名</th><th>状态</th>
@@ -18,14 +20,26 @@
       <td>
         {% if l.revoked %}<span class="bad">已撤回</span>{% if l.revoked_at %}<br>
           <span class="muted">{{ l.revoked_at }}</span>{% endif %}
+        {% elif not l.commercial %}<span class="muted">有效（不可商用）</span>
         {% else %}<span class="ok">有效</span>{% endif %}
       </td>
       <td>{{ l.used_by or "—" }}</td>
       <td class="muted">{{ l.batch_label }}</td>
       <td>
         {% if not l.revoked %}
+        {% if l.preview %}
+        <div class="muted">撤回后：
+          {% for p in l.preview %}
+          <div>{{ p.exhibition_no }} →
+            {% if not p.next_license_no %}<span class="bad">缺授权</span>
+            {% elif p.same_attribution %}<span class="ok">自动递补 {{ p.next_license_no }}</span>
+            {% else %}<span class="warn">换用 {{ p.next_license_no }}，待确认署名</span>{% endif %}
+          </div>
+          {% endfor %}
+        </div>
+        {% endif %}
         <form class="inline" method="post" action="/licenses/{{ l.id }}/revoke"
-              onsubmit="return confirm('确定撤回授权 {{ l.license_no }}？撤回后不可恢复。');">
+              onsubmit="return confirm('确定撤回授权 {{ l.license_no }}？撤回后不可恢复。若存在同署名有效商用授权将自动递补。');">
           <button type="submit" class="danger">撤回</button>
         </form>
         {% else %}—{% endif %}
